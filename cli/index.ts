@@ -28,7 +28,8 @@ import crypto from 'crypto';
 import { execSync } from 'child_process';
 import readline from 'readline'
 import { Buffer } from 'buffer/'
-import SerialPort from 'serialport';
+// import SerialPort from 'serialport'; // No longer needed directly for list
+import { autoDetect } from '@serialport/bindings-cpp'; // Import autoDetect
 import { Command } from 'commander';
 import { ScriptExecutionError, MicroPythonDevice, WEBSERVER_PORT, FileListEntry } from '../src/main';
 import { delayMillis } from '../src/utils';
@@ -70,7 +71,8 @@ const logVerbose = (...msg: any) => {
 }
 
 const listSerialDevices = async () => {
-  const devices = await SerialPort.list();
+  const DetectedBinding = autoDetect(); // Get the binding
+  const devices = await DetectedBinding.list(); // Use list from the binding
 
   // Apply some filters
   return devices.filter(device => device.manufacturer || device.serialNumber || device.vendorId)
@@ -149,7 +151,7 @@ const ensureConnectedDevice = async (options?: EnsureConnectedDeviceOptions) => 
     if (micropython.isProxyConnection()) {
       logVerbose(`Reusing an existing instance via http://localhost:${WEBSERVER_PORT}/api/`)
     }
-  } catch (e) {
+  } catch (e: any) { // Add type 'any' to the caught error
     logError('Could not connect:', e.toString())
     process.exit(1)
   }

@@ -23,7 +23,7 @@ try {
   // tslint:disable-next-line: no-var-requires
   webserver = require('./webserver')
   // tslint:disable-next-line: no-empty
-} catch {}
+} catch { }
 
 const delayMillis = (delayMs: number) => new Promise(resolve => setTimeout(resolve, delayMs));
 
@@ -533,7 +533,9 @@ export class MicroPythonDevice {
    * Handle incoming data
    */
   private async handleProtocolData(data: Buffer) {
-    // debug2('handleProtocolData:', data)
+    debug('handleProtocolData: Received data (length):', data.length);
+    // For very detailed debugging, uncomment the next line, but it can be very noisy:
+    // debug('handleProtocolData: Raw data:', data.toString('hex'));
 
     // Special protocol modes: GET_VER, GET_FILE, PUT_FILE
     if (this.state.replMode === ReplMode.GETVER_WAITING_RESPONSE) {
@@ -552,6 +554,7 @@ export class MicroPythonDevice {
 
     // If in terminal mode, just pass terminal on to user defined handler
     if (this.isConnected() && this.state.replMode === ReplMode.TERMINAL) {
+      debug('handleProtocolData: In TERMINAL mode, forwarding to onTerminalData.');
       if (this.onTerminalData) this.onTerminalData(data.toString())
       return
     }
@@ -562,13 +565,15 @@ export class MicroPythonDevice {
     // Perpare strings for easy access
     const dataStr = this.state.dataRawBuffer.toString()
     const dataTrimmed = dataStr.trim()
-    debug2('handleProtocolData', data, '=>', dataStr)
+    // debug2('handleProtocolData', data, '=>', dataStr) // Keep debug2 for less noise if needed
+    debug('handleProtocolData: Current raw buffer string:', dataStr);
 
     // Handle RAW_MODE data (receiving response, receiving error, waiting for end, changing back to friendly repl)
     if (this.state.replMode === ReplMode.SCRIPT_RAW_MODE) {
       if (this.state.rawReplState === RawReplState.SCRIPT_SENT) {
         // After script is sent, we wait for OK, then stdout_output, then \x04, then stderr_output
-        // OK[ok_output]\x04[error_output][x04]>
+        // OK[ok_output]\x04[error_output]\x04>
+        debug('handleProtocolData: In SCRIPT_SENT state, waiting for "OK"...');
         if (dataTrimmed.startsWith('OK')) {
           debug2('- ok received, start collecting input')
           this.clearBuffer()
@@ -585,7 +590,8 @@ export class MicroPythonDevice {
         for (const entry of data) {
           debug2('- process entry:', entry)
 
-          // There are 3 special markers: switching from output to error, from error to waiting for end, and
+          // There are 3 special markers: switching from output to error (\x04), from error to waiting for end (\x04), and final prompt (>)
+          debug(`handleProtocolData: Processing byte 0x${entry.toString(16)} in subState ${this.state.receivingResponseSubState}`);
           if (entry === 0x04 && this.state.receivingResponseSubState === RawReplReceivingResponseSubState.SCRIPT_RECEIVING_OUTPUT) {
             debug2('- switching error part')
             this.state.receivingResponseSubState = RawReplReceivingResponseSubState.SCRIPT_RECEIVING_ERROR
@@ -605,9 +611,11 @@ export class MicroPythonDevice {
 
             if (this.state.errorBuffer.length > 0 && this.state.replPromiseReject) {
               // Handle error result. Also needs to exit raw repl.
+              debug('handleProtocolData: Script finished with error.');
               this.state.replPromiseReject(new ScriptExecutionError(this.state.errorBuffer))
 
             } else if (this.state.replPromiseResolve) {
+              debug('handleProtocolData: Script finished successfully.');
               this.state.replPromiseResolve(this.state.inputBuffer)
             }
 
@@ -631,6 +639,11 @@ export class MicroPythonDevice {
   }
 
   sendData(data: string | Buffer | ArrayBuffer) {
+    // Avoid logging large buffers directly
+    const logData = (typeof data === 'string' || Buffer.isBuffer(data))
+        ? (data.length > 100 ? `${data.constructor.name} length=${data.length}` : data)
+        : `ArrayBuffer length=${data.byteLength}`;
+    debug('sendData:', logData);
     if (this.state.connectionMode === ConnectionMode.NETWORK) {
       return this.wsSendData(data)
     } else {
@@ -692,11 +705,12 @@ export class MicroPythonDevice {
    * @throws {ScriptExecutionError} on Python code execution error. Includes the Python traceback.
    */
   public async runScript(script: string, options: RunScriptOptions = {}): Promise<string> {
+    const originalScript = script; // Keep original for logging if needed
     // Prepare script for execution (dedent by default)
     if (!options.disableDedent) script = dedent(script)
     if (options.runGcCollectBeforeCommand) script = "import gc; gc.collect();\n" + script
 
-    debug(`runScript\n${script}`)
+    debug(`runScript: Preparing to run (stayInRawRepl=${!!options.stayInRawRepl}, resolveBeforeResult=${!!options.resolveBeforeResult}). Script:\n${script}`); // Log options and final script
 
     if (this.isProxyConnection()) {
       let url = `http://localhost:${WEBSERVER_PORT}/api/run-script/`
@@ -714,8 +728,9 @@ export class MicroPythonDevice {
       }
       return content
     }
-
+    debug('runScript: Entering raw REPL...');
     await this.enterRawRepl()
+    debug('runScript: Raw REPL entered.');
     debug('runScript: raw mode entered')
 
     // Send data to raw repl. Note: cannot send too much data at once over the
@@ -729,8 +744,12 @@ export class MicroPythonDevice {
     while (script.length) {
       const chunk = script.substring(0, chunkSize)
       script = script.substr(chunkSize)
+      debug(`runScript: Sending chunk (${chunk.length} bytes)`);
       this.sendData(chunk)
-      if (chunkDelayMillis && script.length) await delayMillis(chunkDelayMillis)
+      if (chunkDelayMillis && script.length) {
+        debug(`runScript: Delaying ${chunkDelayMillis}ms before next chunk`);
+        await delayMillis(chunkDelayMillis)
+      }
     }
 
     // debug('runScript: script sent')
@@ -742,57 +761,86 @@ export class MicroPythonDevice {
     const promise = this.createReplPromise()
 
     // Send ctrl+D to execute the uploaded script in the raw repl
+    debug('runScript: Sending Ctrl+D to execute...');
     this.sendData('\x04')
-    debug('runScript: script sent, waiting for response')
+    debug('runScript: Ctrl+D sent, waiting for promise resolution...');
 
     if (options.resolveBeforeResult) return ''
 
     // wait for script execution
-    const scriptOutput = await promise
-    debug('output', scriptOutput)
+    let scriptOutput: string | undefined;
+    let scriptError: Error | undefined;
+    try {
+      scriptOutput = await promise;
+      debug('runScript: Promise resolved. Output length:', scriptOutput?.length);
+      // debug('output', scriptOutput) // Avoid logging potentially huge output
+    } catch (err: any) {
+      debug('runScript: Promise rejected.', err);
+      scriptError = err;
+    }
+
 
     const millisRuntime = Math.round(Date.now() - millisStart)
     debug(`runScript: script done (${millisRuntime / 1000}sec)`)
     this.state.lastRunScriptTimeNeeded = millisRuntime
 
-    // await this.exitRawRepl()
+    // await this.exitRawRepl() // Still commented out
 
-    return scriptOutput
+    if (scriptError) {
+      throw scriptError; // Re-throw error after logging
+    }
+    return scriptOutput!; // Non-null assertion, assuming error is thrown if undefined
   }
 
   private async enterRawRepl() {
+    debug('enterRawRepl: Entering...');
     // see also https://github.com/scientifichackers/ampy/blob/master/ampy/pyboard.py#L175
     // debug('enterRawRepl')
     if (this.state.replMode === ReplMode.SCRIPT_RAW_MODE) {
-      return debug('enterRawRepl: already in raw repl mode')
+      debug('enterRawRepl: Already in raw REPL mode, skipping.');
+      return;
     }
 
     this.state.replMode = ReplMode.SCRIPT_RAW_MODE
 
     // Send ctrl-C twice to interrupt any running program
+    debug('enterRawRepl: Sending Ctrl+C x2');
     this.sendData('\r\x03\x03')
-    // await delayMillis(100) // wait 0.1sec
+    // await delayMillis(100) // wait 0.1sec - Keep commented unless needed
 
+    debug('enterRawRepl: Waiting for ">>>" prompt (5s timeout)...');
     try {
       await this.readUntil('>>>', 5)
+      debug('enterRawRepl: Got ">>>" prompt.');
     } catch {
+      debug('enterRawRepl: Timeout waiting for ">>>", trying Ctrl+C, Ctrl+B...');
       // Might be stuck in raw repl. Try to exit into friendly repl with Ctrl+B
       this.sendData('\r\x03\x02')
       await this.readUntil('>>>', 5)
+      debug('enterRawRepl: Got ">>>" after Ctrl+B.');
     }
 
+    debug('enterRawRepl: Sending Ctrl+A to enter raw REPL...');
     this.sendData('\x01')  // ctrl+A
     await this.readUntil('raw REPL; CTRL-B to exit\r\n>')
+    debug('enterRawRepl: Got raw REPL prompt.');
 
     this.clearBuffer()
     this.state.rawReplState = RawReplState.WAITING_FOR_SCRIPT
+    debug('enterRawRepl: Exiting successfully.');
   }
 
   private async exitRawRepl() {
+    debug('exitRawRepl: Entering...');
     // debug('exitRawRepl')
-    if (this.state.replMode !== ReplMode.SCRIPT_RAW_MODE) return
+    if (this.state.replMode !== ReplMode.SCRIPT_RAW_MODE) {
+        debug('exitRawRepl: Not in raw REPL mode, skipping.');
+        return;
+    }
+    debug('exitRawRepl: Sending Ctrl+B to exit raw REPL...');
     this.sendData('\r\x02')
     await this.readUntil('>>>')
+    debug('exitRawRepl: Got ">>>" prompt, exited raw REPL.');
     this.state.replMode = ReplMode.TERMINAL
   }
 
@@ -931,11 +979,14 @@ export class MicroPythonDevice {
    * @param data
    */
   public async putFile(targetFilename: string, data: Buffer, options: PutFileOptions = {}) {
-    debug(`putFile: ${targetFilename} (${data.length})`)
+    debug(`putFile: Starting upload of ${targetFilename} (${data.length} bytes)`);
 
     if (options.checkIfSimilarBeforeUpload) {
-      const isAlreadyTheSame = await this.isFileTheSame(targetFilename, data)
-      if (isAlreadyTheSame) return true
+      const isAlreadyTheSame = await this.isFileTheSame(targetFilename, data);
+      if (isAlreadyTheSame) {
+          debug(`putFile: File ${targetFilename} is already the same on device. Skipping.`);
+          return true;
+      }
     }
 
     this.createReplPromise()
@@ -943,17 +994,25 @@ export class MicroPythonDevice {
     // const chunkSize = this.isSerialDevice() ? 256 : 64
     const chunkSize = this.isProxyConnection() ? 5000 : this.isSerialDevice() ? 3000 : 64
 
-    const script1 = `import ubinascii; f = open('${targetFilename}', 'wb')`
-    await this.runScript(script1, { stayInRawRepl: true, runGcCollectBeforeCommand: true }) // keeps raw repl open for next instruction
+    const script1 = `import ubinascii; f = open('${targetFilename}', 'wb')`;
+    debug(`putFile: Opening file on device with: ${script1}`);
+    await this.runScript(script1, { stayInRawRepl: true, runGcCollectBeforeCommand: true }); // keeps raw repl open for next instruction
+    debug(`putFile: File opened on device.`);
 
+    const totalChunks = Math.ceil(dataHex.length / chunkSize);
+    debug(`putFile: Starting to send ${totalChunks} chunks...`);
     for (let index = 0; index < dataHex.length; index += chunkSize) {
-      const chunk = dataHex.substr(index, chunkSize)
-      debug('chunk', chunk)
-      const scriptForChunk = `f.write(ubinascii.unhexlify("${chunk}"))`
-      await this.runScript(scriptForChunk, { stayInRawRepl: true }) // keeps raw repl open for next instruction
+      const chunkIndex = Math.floor(index / chunkSize) + 1;
+      const chunk = dataHex.substr(index, chunkSize);
+      // debug('chunk', chunk) // Avoid logging potentially large chunks
+      const scriptForChunk = `f.write(ubinascii.unhexlify("${chunk}"))`;
+      debug(`putFile: Writing chunk ${chunkIndex}/${totalChunks} (${chunk.length / 2} bytes)`); // chunk length is hex, divide by 2 for bytes
+      await this.runScript(scriptForChunk, { stayInRawRepl: true }); // keeps raw repl open for next instruction
     }
-
-    await this.runScript('f.close()') // finally closes raw repl, switching back to friendly
+debug(`putFile: All chunks sent. Closing file on device...`);
+await this.runScript('f.close()'); // finally closes raw repl, switching back to friendly
+debug(`putFile: File ${targetFilename} uploaded successfully.`);
+return true;
     return true
   }
 

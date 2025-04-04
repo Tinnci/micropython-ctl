@@ -6,12 +6,14 @@ import { MicroPythonDevice } from '../src/main';
 import assert from 'assert'
 import crypto from 'crypto';
 import { Buffer } from 'buffer/'
-import SerialPort from 'serialport';
+// import SerialPort from 'serialport'; // No longer needed directly for list
+import { autoDetect } from '@serialport/bindings-cpp'; // Import autoDetect
 import { delayMillis } from '../src/utils';
 import { Command } from 'commander';
 
 const listSerialDevices = async () => {
-  const devices = await SerialPort.list();
+  const DetectedBinding = autoDetect(); // Get the binding
+  const devices = await DetectedBinding.list(); // Use list from the binding
   return devices.filter(device => device.manufacturer || device.serialNumber || device.vendorId)
 }
 
